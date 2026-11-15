@@ -1,0 +1,2 @@
+# only needed for REAL buying (see live_trade.py):
+py-clob-client
