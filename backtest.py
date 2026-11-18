@@ -11,6 +11,10 @@ What changed vs v1
   * Matches without a real scheduled start time are skipped (v1 fell back to endDate = look-ahead).
   * Data goes to backtest_v2.csv, so the broken v1 file is never reused.
 
+v4: strategy "stack" (edge_stack.py) = value + fatigue veto/boost + grade-based Kelly sizing.  The sharp-line layer has no
+historical data here, so it is OFF in the backtest (grades are therefore capped at C/B; compare flat-stake ROI instead).
+Fatigue is only measured on matches whose dates are exact (Polymarket-era rows), see edge_stack.Workload.snapshot.
+
 NOT tested against the live API from the environment this was written in - run `python backtest.py --fetch 300`
 first and inspect data/backtest_v2.csv (p1+p2 should be ~1.0 and strictly between 0.03 and 0.97).
 """
@@ -18,9 +22,11 @@ import os, math, time
 import numpy as np
 import pandas as pd
 import requests
+import edge_stack as es
 import tennis_core as tc
 
 DS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "backtest_v2.csv")
+FAT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "backtest_v2_fatigue.csv")
 COLS = ["event_id", "market_id", "match", "surface", "start", "p1", "p2", "model_p1", "model_p2", "winner", "n1", "n2"]
 LAG_DAYS = 21          # Sackmann dates are tournament START dates: 21d keeps a 2-week Slam's own results out
 PRICE_LAG_MIN = 30     # price must be from at least this many minutes before the start
@@ -121,8 +127,36 @@ def fetch_dataset(max_events=1500, progress=None):
 def load_dataset():
     ds = pd.read_csv(DS)
     ds["start"] = pd.to_datetime(ds.start, utc=True, errors="coerce")
-    ds = ds.dropna(subset=["start"])
-    return ds.drop_duplicates("event_id").sort_values("start").reset_index(drop=True)
+    ds = ds.dropna(subset=["start"]).drop_duplicates("event_id")
+    if os.path.exists(FAT):                                   # fatigue flags per side, built by enrich_dataset()
+        fat = pd.read_csv(FAT).drop_duplicates("event_id")
+        ds = ds.merge(fat, on="event_id", how="left")
+    for c in ("fat1", "fat2"):
+        ds[c] = ds[c].fillna("unknown") if c in ds else "unknown"
+    return ds.sort_values("start").reset_index(drop=True)
+
+
+def enrich_dataset(hist=None):
+    """Add fatigue flags (fat1 / fat2 = flag if we back outcome 1 / 2) for rows that lack them. Resumable."""
+    ds = pd.read_csv(DS)
+    ds["start"] = pd.to_datetime(ds.start, utc=True, errors="coerce")
+    have = set(pd.read_csv(FAT).event_id.astype(str)) if os.path.exists(FAT) else set()
+    todo = ds[~ds.event_id.astype(str).isin(have)].dropna(subset=["start"])
+    if todo.empty:
+        return 0
+    hist = tc.load_matches() if hist is None else hist
+    R, W, out = tc.build_ratings(hist), es.Workload.from_matches(hist), []
+    for r in todo.itertuples():
+        outs = r.match.split(" vs ")
+        a, b = (R.find(outs[0]), R.find(outs[1])) if len(outs) == 2 else (None, None)
+        f1 = f2 = "unknown"
+        if a and b and a != b:
+            day = es.day_of(r.start)
+            s1, s2 = (W.snapshot(x, day, exact_only=True) for x in (a, b))
+            f1, f2 = es.fatigue_flag(s1, s2)[0], es.fatigue_flag(s2, s1)[0]
+        out.append(dict(event_id=r.event_id, fat1=f1, fat2=f2))
+    pd.DataFrame(out).to_csv(FAT, mode="a", header=not os.path.exists(FAT), index=False)
+    return len(out)
 
 
 # ------------------------------------------------------------------ strategy replay
@@ -130,7 +164,8 @@ DEFAULTS = dict(min_edge=tc.MIN_EDGE, min_ev=0.0, min_prob=0.25, max_price=tc.MA
                 slip=0.01, fee_rate=tc.FEE_RATE, fee=0.0,   # fee_rate = taker rate; fee = extra % of profit (legacy)
                 min_games=15, mode="flat", stake=20.0, bankroll=1000.0, kelly_frac=0.25, cap=0.05,
                 shrink=tc.MODEL_WEIGHT,      # weight on the model vs the market (1.0 = raw model)
-                strategy="any")              # "any" (both sides) | "favourite" (model favourite) | "underdog" (cheaper side)
+                strategy="any",              # "any" (both sides) | "favourite" | "underdog" | "stack" (edge_stack.decide)
+                use_fatigue=True)            # stack only: apply the fatigue veto / rest boost
 
 # ready-made settings that mirror the live strategies in tennis_core.analyse
 PRESETS = {
@@ -138,9 +173,13 @@ PRESETS = {
                       min_prob=0.0, min_edge=tc.MIN_EDGE, min_ev=0.0, shrink=tc.MODEL_WEIGHT),
     "favourite": dict(strategy="favourite", min_price=tc.MIN_PRICE, max_price=tc.MAX_PRICE,
                       min_prob=0.0, min_edge=tc.MIN_EDGE, min_ev=0.0, shrink=tc.MODEL_WEIGHT),
+    # stack, maker entry (no taker fee). OPTIMISTIC: assumes every limit order fills at last trade + slip.
+    "stack":       dict(strategy="stack", min_prob=0.0, shrink=tc.MODEL_WEIGHT, fee_rate=es.MAKER_FEE_RATE, use_fatigue=True),
+    # stack, taker entry (pays taker fee): the conservative bound for the same signals.
+    "stack_taker": dict(strategy="stack", min_prob=0.0, shrink=tc.MODEL_WEIGHT, fee_rate=tc.FEE_RATE, use_fatigue=True),
 }
 
-_COLS_OUT = ["start", "match", "pick", "ask", "model_p", "stake", "won", "pnl", "bankroll", "surface"]
+_COLS_OUT = ["start", "match", "pick", "ask", "model_p", "stake", "won", "pnl", "bankroll", "surface", "grade", "fatigue"]
 
 
 def run_backtest(ds, **kw):
@@ -159,7 +198,17 @@ def run_backtest(ds, **kw):
             sides = [min(sides, key=lambda x: x[2])]                       # the cheaper side only
         elif P["strategy"] == "favourite":
             sides = [max(sides, key=lambda x: x[1])]                       # the model favourite only
-        best = None
+        best, stack_d = None, None
+        if P["strategy"] == "stack":
+            for idx, (p, model_p, ask, mkt_p) in enumerate(sides):
+                eff = min(ask + P["slip"], 0.99)
+                adj_p = tc.adjusted_prob(model_p, mkt_p, P["shrink"])
+                fee_ps = tc.taker_fee(eff, P["fee_rate"])
+                flag = getattr(r, "fat1" if idx == 0 else "fat2", "unknown")
+                d = es.decide(adj_p, eff, fee_ps, None, flag, use_fatigue=P["use_fatigue"], require_sharp=False)
+                if d["ok"] and (best is None or d["edge"] > best[0]):
+                    best, stack_d = (d["edge"], p, adj_p, eff, eff + fee_ps), {**d, "fatigue": flag}
+            sides = []                                                    # skip the generic loop below
         for p, model_p, ask, mkt_p in sides:
             eff = min(ask + P["slip"], 0.99)
             adj_p = tc.adjusted_prob(model_p, mkt_p, P["shrink"])           # model pulled toward the market
@@ -175,7 +224,11 @@ def run_backtest(ds, **kw):
             continue
         edge, p, adj_p, eff, cost_ps = best
         stake = P["stake"]
-        if P["mode"] == "kelly":
+        if stack_d and P["use_fatigue"] and stack_d["fatigue"] == "rest_edge":
+            stake *= es.REST_BOOST
+        if stack_d and P["mode"] == "kelly":
+            stake = bank * stack_d["frac"]                                 # quarter-Kelly, grade cap, rest boost already applied
+        elif P["mode"] == "kelly":
             b_odds = 1 / cost_ps - 1
             f = (adj_p * b_odds - (1 - adj_p)) / b_odds
             stake = min(max(0.0, bank * P["kelly_frac"] * f), bank * P["cap"])
@@ -188,7 +241,8 @@ def run_backtest(ds, **kw):
         pnl = gross - stake - ((gross - stake) * P["fee"] if won and P["fee"] > 0 else 0.0)
         bank += pnl
         bets.append(dict(start=r.start, match=r.match, pick=p, ask=eff, model_p=adj_p, stake=stake,
-                         won=won, pnl=pnl, bankroll=bank, surface=r.surface))
+                         won=won, pnl=pnl, bankroll=bank, surface=r.surface,
+                         grade=stack_d["grade"] if stack_d else "", fatigue=stack_d["fatigue"] if stack_d else ""))
     out = pd.DataFrame(bets, columns=_COLS_OUT)
     out.attrs["bankroll0"] = bank0
     return out
@@ -272,12 +326,15 @@ if __name__ == "__main__":
     ap.add_argument("--fetch", type=int, default=1500)
     a = ap.parse_args()
     fetch_dataset(a.fetch, progress=lambda i, t: print(f"\r{i}/{t}", end="", flush=True))
+    print(f"\nfatigue flags added for {enrich_dataset()} matches")
     ds = load_dataset()
     print(f"\n{len(ds)} matches, {ds.start.min():%Y-%m-%d} .. {ds.start.max():%Y-%m-%d}")
+    print("fatigue flags (pick side) in dataset:", pd.concat([ds.fat1, ds.fat2]).value_counts().to_dict())
     print("model vs market:", diagnostics(ds)[0])
     show = lambda S: {k: (tuple(round(float(x), 3) for x in v) if isinstance(v, tuple) else round(float(v), 3)) for k, v in S.items()}
     for name, kw in PRESETS.items():
         print(f"\n[{name}]", show(summarize(run_backtest(ds, stake=20, **kw))))
+    print("\n[stack WITHOUT fatigue layer]", show(summarize(run_backtest(ds, stake=20, **{**PRESETS["stack"], "use_fatigue": False}))))
     print("\nBLIND underdogs (every side priced .15-.40, after fees):", baseline(ds, .15, .40, .01))
     print("BLIND favourites (every side priced .60-.85, after fees):", baseline(ds, .60, .85, .01))
     print("\nRead the 95% CI: if it includes 0 (or negative values) there is NO proven edge.")

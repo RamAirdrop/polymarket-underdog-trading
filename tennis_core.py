@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 import pandas as pd
 import requests
 
+import edge_stack as es
+
 GAMMA = "https://gamma-api.polymarket.com"
 SOURCES = [
     "https://raw.githubusercontent.com/Aneeshers/tennis-sackmann-archive/main/{tour}/{tour}_matches_{year}.csv",
@@ -43,7 +45,7 @@ def load_matches(years=None, tours=("atp", "wta"), max_age_h=24, gap_fill=True):
                         pass
             if os.path.exists(path):
                 df = pd.read_csv(path, usecols=lambda c: c in
-                                 {"tourney_date", "surface", "winner_name", "loser_name", "match_num", *STAT_COLS})
+                                 {"tourney_date", "surface", "winner_name", "loser_name", "match_num", "round", "draw_size", "minutes", *STAT_COLS})
                 df["tour"] = t
                 frames.append(df)
     if not frames:
@@ -365,7 +367,7 @@ STAKE_FRAC = 0.02               # default stake as share of bankroll (was 5%)
 ALLOW_LIVE_WITHOUT_SCORE = False  # live match but no reliable score feed -> PASS
 
 # --- strategy selection ("favourite" | "underdog" | "both")
-STRATEGY = "underdog"
+STRATEGY = "underdog"           # "favourite" | "underdog" | "both" | "stack"  (stack = edge_stack.py, pre-match only)
 MODEL_WEIGHT = 0.5              # adjusted_p = w*model + (1-w)*market_fair. The raw model is ~3-5 pts overconfident on
                                 # favourites (walk-forward check), so it is pulled toward the market before any edge is computed.
 UNDERDOG_MIN_PRICE, UNDERDOG_MAX_PRICE = 0.15, 0.40   # market underdog = the cheaper side, bought inside this band
@@ -510,7 +512,67 @@ def detect_surface(ev, override=None):
     return "Hard"
 
 
-def analyse(events, R, bankroll=1000, surface=None, allow_live=True, min_games=5, live_scores=None, target_date=None, strategy=None):
+def _stack_pick(row, outs, a, b, surf, start, live, live_ok, asks, bids, adj, mkt, pm, bankroll,
+                workload, sharp, check_liquidity, m):
+    """Pre-match stack (edge_stack.py): evaluate both sides, return the best passing side, or the best-edge reject."""
+    def reject(k, why):
+        return dict(k=k, why=why, price=asks[k], fee=0.0, edge=None, frac=0.0, grade="", p=adj[k], limit=None,
+                    fatigue="", fatigue_note="", sharp_p=None, sharp_flag="")
+
+    if live:
+        return reject(0 if adj[0] >= adj[1] else 1, "PASS (stack is pre-match only: thesis is locked before the first serve)")
+    day = es.day_of(start if pd.notna(start) else pd.Timestamp.now(tz="UTC"))
+    cov = workload is not None and workload.coverage_ok(day)
+    snaps = [workload.snapshot(x, day) if workload else None for x in (a, b)]
+    recs = []
+    for k in (0, 1):
+        ask, bid = asks[k], bids[k]
+        lim = es.limit_price(bid, ask)
+        if lim is None:
+            continue
+        if es.EDGE_BASIS == "ask":
+            entry, fee = ask, taker_fee(ask)
+        else:
+            entry, fee = lim, taker_fee(lim, es.MAKER_FEE_RATE)
+        sp = None
+        sh = sharp.lookup(outs[0], outs[1]) if sharp else None
+        if sh:
+            sp = sh[k]
+        if workload and snaps[0] is not None:
+            flag, note = es.fatigue_flag(snaps[k], snaps[1 - k], cov)
+        else:
+            flag, note = "unknown", "no workload log"
+        d = es.decide(adj[k], entry, fee, sp, flag)
+        d.update(k=k, price=entry, fee=fee, limit=lim, fatigue=flag, fatigue_note=note, sharp_p=sp)
+        recs.append(d)
+    if not recs:
+        return reject(0, "PASS (no usable bid/ask)")
+    passing = [d for d in recs if d["ok"]]
+    best = max(passing, key=lambda d: d["edge"]) if passing else max(recs, key=lambda d: d["edge"] if d["edge"] is not None else -9)
+    best["why"] = None if best["ok"] else f"PASS (stack: {best['reason']})"
+    stake = bankroll * best["frac"]
+    if best["ok"] and check_liquidity:
+        try:
+            toks = _j(m.get("clobTokenIds"))
+            _, book_asks = get_book(toks[best["k"]])
+            ok, depth = es.depth_ok(book_asks, stake)
+            row["liq"] = f"ask depth ${depth:,.0f} vs {es.LIQ_MULT:.0f}x stake ${stake:,.0f}"
+            if not ok:
+                best["why"] = f"PASS (stack: thin book - {row['liq']})"
+        except Exception as e:
+            best["why"] = f"PASS (stack: order book unreadable: {type(e).__name__})"
+    row.update(grade=best["grade"], limit=best["limit"], fatigue=best["fatigue"], fatigue_note=best["fatigue_note"],
+               sharp_p=best["sharp_p"], sharp_flag=best["sharp_flag"])
+    return best
+
+
+def build_workload(df=None):
+    """Match log (dates + durations) used by the fatigue layer. Pass the same df you built the ratings from."""
+    return es.Workload.from_matches(load_matches() if df is None else df)
+
+
+def analyse(events, R, bankroll=1000, surface=None, allow_live=True, min_games=5, live_scores=None, target_date=None, strategy=None,
+            workload=None, sharp=None, check_liquidity=True):
     now = pd.Timestamp.now(tz="UTC")
     rows = []
     for ev in events:
@@ -544,6 +606,7 @@ def analyse(events, R, bankroll=1000, surface=None, allow_live=True, min_games=5
         ask0 = float(ask) if ask else px[0]
         ask1 = 1 - float(bid) if bid else px[1]
         asks = [min(ask0, 0.99), min(ask1, 0.99)]
+        bids = [float(bid) if bid else None, (1 - float(ask)) if ask else None]   # side-1 bid = 1 - side-0 ask
         live = bool(ev.get("live")) or (pd.notna(start) and start <= now)
         surf = detect_surface(ev, surface)
         a, b = R.find(outs[0]), R.find(outs[1])
@@ -555,7 +618,8 @@ def analyse(events, R, bankroll=1000, surface=None, allow_live=True, min_games=5
                "signal": "", "pick": "", "price": None, "model_p": None, "edge": None, "ev": None,
                "stake": None, "payout_x": None, "form": "", "url": f"https://polymarket.com/event/{ev.get('slug','')}",
                "market_id": m.get("id"), "tokens": _j(m.get("clobTokenIds")), "outs": outs,
-               "asks": asks, "blend": None, "side": None, "why": "", "role": "", "score": "", "live_check": "", "adj": None, "strategy": "", "model_raw": None}
+               "asks": asks, "blend": None, "side": None, "why": "", "role": "", "score": "", "live_check": "", "adj": None, "strategy": "", "model_raw": None,
+               "grade": "", "limit": None, "fatigue": "", "fatigue_note": "", "sharp_p": None, "sharp_flag": "", "liq": ""}
 
         if "/" in outs[0] or "/" in outs[1]:
             row["signal"] = "doubles - skipped"
@@ -593,6 +657,21 @@ def analyse(events, R, bankroll=1000, surface=None, allow_live=True, min_games=5
             adj = [adjusted_prob(pm[k], mkt[k]) for k in (0, 1)]       # model shrunk toward market
 
             strat = strategy or STRATEGY
+            if strat == "stack":
+                best = _stack_pick(row, outs, a, b, surf, start, live, live_ok, asks, bids, adj, mkt, pm, bankroll,
+                                   workload, sharp, check_liquidity, m)
+                k = best["k"]
+                sig = (f"BUY {outs[k]} (stack {best['grade']}: p {best['p']:.0%} vs limit {best['price']:.0%})"
+                       if best["why"] is None else best["why"])
+                row["blend"] = pm
+                row["why"] = R.explain(a, b, surf)
+                row["role"] = "underdog" if best["price"] < 0.5 else "favourite"
+                row.update(side=k, pick=outs[k], price=best["price"], model_p=best["p"], model_raw=pm[k], adj=adj,
+                           strategy="stack", edge=best["edge"], ev=best["p"] / (best["price"] + best["fee"]) - 1,
+                           payout_x=1 / best["price"], form=f"{form[0]:.0%} / {form[1]:.0%}",
+                           stake=round(bankroll * best["frac"], 2), signal=sig)
+                rows.append(row)
+                continue
             cands = []
             if strat in ("favourite", "both"):
                 cands.append(("favourite", fav_i, MIN_PRICE, MAX_PRICE, STAKE_FRAC))
@@ -659,6 +738,7 @@ def main():
     ap.add_argument("--price", type=float, default=1 / 3)
     ap.add_argument("--win", type=float, default=0.40)
     ap.add_argument("--surface", default=None)
+    ap.add_argument("--strategy", default=None, choices=["underdog", "favourite", "both", "stack"])
     a = ap.parse_args()
     pd.set_option("display.width", 220, "display.max_columns", 30)
 
@@ -673,9 +753,13 @@ def main():
     elif a.cmd == "calib":
         print(calibration())
     else:
-        R = build_ratings()
-        df = analyse(fetch_events(), R, bankroll=a.bankroll, surface=a.surface)
-        cols = ["match", "surface", "live", "vol_24h", "p1", "pick", "price", "model_p", "edge", "signal"]
+        hist = load_matches()
+        R = build_ratings(hist)
+        stack = (a.strategy or STRATEGY) == "stack"
+        df = analyse(fetch_events(), R, bankroll=a.bankroll, surface=a.surface, strategy=a.strategy,
+                     workload=build_workload(hist) if stack else None,
+                     sharp=es.SharpFeed(DATA_DIR) if stack else None)
+        cols = ["match", "surface", "live", "vol_24h", "p1", "pick", "price", "model_p", "edge", "grade", "fatigue", "signal"]
         print(df[cols].head(40).to_string(index=False, float_format=lambda x: f"{x:,.3f}"))
         log_signals(df)
         print(f"\n{(df.signal.str.startswith('BUY')).sum()} BUY signals logged to data/signals_log.csv")

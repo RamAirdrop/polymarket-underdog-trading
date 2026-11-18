@@ -7,6 +7,7 @@ import streamlit as st
 import backtest as bt
 import live_trade
 import livescores
+import edge_stack as es
 import paper
 import tennis_core as tc
 
@@ -26,6 +27,21 @@ st.title("🎾 Polymarket Tennis — Markets · Paper/Real buy · Daily P&L")
 @st.cache_resource(ttl=6 * 3600, show_spinner="Downloading history & building ratings…")
 def ratings():
     return tc.build_ratings()
+
+
+@st.cache_resource(ttl=6 * 3600, show_spinner="Building workload log (fatigue layer)…")
+def workload():
+    return tc.build_workload()
+
+
+@st.cache_resource
+def sharp_feed():
+    return es.SharpFeed(tc.DATA_DIR)
+
+
+def _f(x):
+    """NaN / None -> None (DataFrame rows turn missing floats into NaN)."""
+    return None if x is None or (isinstance(x, float) and pd.isna(x)) else x
 
 
 @st.cache_data(ttl=20, show_spinner="Fetching Polymarket…")
@@ -102,14 +118,61 @@ if pend:
         if k2.button("Cancel"):
             del st.session_state["pending_real"]; st.rerun()
 
+pend_l = st.session_state.get("pending_real_limit")
+if pend_l:
+    with st.container(border=True):
+        st.error(f"💵 REAL MONEY — rest a limit buy of **${pend_l['usd']:.0f}** on **{pend_l['pick']}** in {pend_l['match']} "
+                 f"at **{pend_l['limit']:.2f}**? It expires by itself at the scheduled start.")
+        k1, k2, _ = st.columns([1, 1, 4])
+        if k1.button("✅ Confirm real limit order"):
+            tdf = paper.trades_df(mark=False)
+            spent = float(tdf[(tdf["mode"] == "real") & (tdf.day == paper.today())].cost.sum()) if not tdf.empty else 0.0
+            odf = paper.orders_df()
+            spent += float(odf[(odf["mode"] == "real") & (odf.status == "open")].usd.sum()) if not odf.empty else 0.0
+            if not live_trade.enabled():
+                st.warning("Real trading is switched off. Follow the setup notes at the top of live_trade.py.")
+            elif spent + pend_l["usd"] > live_trade.daily_limit():
+                st.warning(f"Daily real-spend limit ${live_trade.daily_limit():.0f} would be exceeded (committed ${spent:.0f}).")
+            else:
+                try:
+                    res = live_trade.real_limit_buy(pend_l["token"], pend_l["usd"], pend_l["limit"], pend_l["start_ts"])
+                    if res["ok"]:
+                        paper.place_limit(pend_l["market_id"], pend_l["token"], pend_l["match"], pend_l["pick"],
+                                          pend_l["surface"], pend_l["url"], pend_l["usd"], pend_l["limit"],
+                                          start=pend_l["start"], model_p=pend_l["model_p"], edge=pend_l["edge"],
+                                          grade=pend_l["grade"], fatigue=pend_l["fatigue"], sharp_p=pend_l["sharp_p"],
+                                          mode="real", ext_id=res["order_id"])
+                        st.success(f"Limit order resting: {res['size']} shares @ {res['price']}. Order id {res['order_id']}")
+                        del st.session_state["pending_real_limit"]
+                    else:
+                        st.error(f"Order rejected: {res['raw']}")
+                except Exception as e:
+                    st.error(f"Order failed: {e}")
+        if k2.button("Cancel ", key="cancel_limit"):
+            del st.session_state["pending_real_limit"]; st.rerun()
+
 tab1, tab2, tab3 = st.tabs(["📡 Markets", "📒 Positions & daily P&L", "🧪 Backtest"])
 
 # ------------------------------------------------------------------ tab 1: markets with buy buttons & toggleable refresh
 with tab1:
-    strat_label = st.radio("Strategy", ["Underdog", "Favourite", "Both"], horizontal=True, key="strategy_radio",
+    strat_label = st.radio("Strategy", ["Underdog", "Favourite", "Both", "Stack (pre-match)"], horizontal=True, key="strategy_radio",
                            help="Underdog: cheaper side priced 15-40c. Favourite: model favourite priced 30-80c. "
-                                "Both use the model shrunk toward the market and need a 5-point edge after fees.")
-    STRAT = {"Underdog": "underdog", "Favourite": "favourite", "Both": "both"}[strat_label]
+                                "Both use the model shrunk toward the market and need a 5-point edge after fees. "
+                                "Stack: value edge + fatigue veto + sharp-line check + limit-order entry + quarter-Kelly "
+                                "sizing; pre-match only (see edge_stack.py).")
+    STRAT = {"Underdog": "underdog", "Favourite": "favourite", "Both": "both", "Stack (pre-match)": "stack"}[strat_label]
+    bankroll = st.number_input("Bankroll ($) used for suggested stake sizes", 100.0, 10_000_000.0, 1000.0, 100.0, key="bankroll_in")
+    cmp1, cmp2 = st.columns([3, 1])
+    auto_all_on = cmp1.toggle("🤖 Paper-trade EVERY strategy automatically (Underdog + Favourite + Stack, same stake) so they can be compared",
+                              value=False, key="auto_all_toggle",
+                              help="Each refresh, every strategy's BUY signals are paper-bought with today's locked stake. "
+                                   "Underdog/Favourite buy at the book; Stack rests a limit order. Compare in Positions > Strategy comparison.")
+    run_all_now = cmp2.button("▶ Run all strategies now", disabled=amt is None)
+    if STRAT == "stack":
+        sf = sharp_feed(); sf.refresh()
+        st.caption(f"Sharp line source: **{sf.source}** ({len(sf.rows)} lines){' · ' + sf.error if sf.error else ''}. "
+                   "No sharp line = grade C (smallest size). Set ODDS_API_KEY or fill data/sharp_odds.csv "
+                   "(player1,player2,odds1,odds2).")
     top = st.columns([1.2, 1.8, 1.8, 1.8, 1.6, 2.8])
     if top[0].button("🔄 Refresh"):
         events.clear()
@@ -135,7 +198,18 @@ with tab1:
     def render_live_markets():
         if auto_refresh:
             events.clear()
-        df = tc.analyse(events(), ratings(), 1000, surface=None if surface == "Auto" else surface, live_scores=LS, target_date=selected_date, strategy=STRAT)
+        paper.process_orders()                                       # fill / expire resting paper orders, reconcile real ones
+        if amt and (auto_all_on or run_all_now):
+            try:
+                new = paper.auto_all(events(), ratings(), workload(), sharp_feed(), amt, bankroll)
+                if any(new.values()):
+                    st.toast("New paper positions: " + ", ".join(f"{k} {v}" for k, v in new.items() if v))
+            except Exception as e:
+                st.error(f"Auto paper-trading failed: {e}")
+        df = tc.analyse(events(), ratings(), bankroll, surface=None if surface == "Auto" else surface, live_scores=LS,
+                        target_date=selected_date, strategy=STRAT,
+                        workload=workload() if STRAT == "stack" else None,
+                        sharp=sharp_feed() if STRAT == "stack" else None)
         if df.empty:
             st.warning("No tennis match markets found for the selected filter or date.")
             return
@@ -176,6 +250,15 @@ with tab1:
                     lab = f"${amt:.0f}" if amt else ""
                     do_paper = b1.button(f"📄 Paper buy {lab}", key=f"p_{mid}", disabled=amt is None)
                     do_real = b2.button(f"💵 Buy {lab}", key=f"r_{mid}", disabled=amt is None)
+                    lim = _f(r.get("limit")); sig_side = _f(r.get("side"))
+                    can_limit = (STRAT == "stack" and lim is not None and sig_side is not None and i == int(sig_side)
+                                 and not r["live"] and str(r["signal"]).startswith("BUY"))
+                    if can_limit:
+                        l1, l2 = st.columns(2)
+                        do_plimit = l1.button(f"🎯 Paper limit {lab} @ {lim:.2f}", key=f"pl_{mid}", disabled=amt is None)
+                        do_rlimit = l2.button(f"🎯 Real limit {lab} @ {lim:.2f}", key=f"rl_{mid}", disabled=amt is None)
+                    else:
+                        do_plimit = do_rlimit = False
                 with cA:
                     st.markdown(f"**{r['match']}** · [Polymarket ↗]({r['url']})")
                     start_str = r["start"].tz_convert("UTC").strftime("%b %d, %I:%M %p") if pd.notna(r["start"]) else "TBD"
@@ -195,8 +278,35 @@ with tab1:
                         st.write(f"Adjusted prob for {side}: **{p_model:.0%}** · edge after fee **{edge:+.1%}** · pays **{1/ask:.2f}x**")
                     if r["signal"]:
                         st.caption("Signal: " + r["signal"])
+                    if STRAT == "stack" and not r["live"]:
+                        sp = _f(r.get("sharp_p"))
+                        st.caption(f"Grade **{r.get('grade') or '-'}** · limit {('%.2f' % r['limit']) if _f(r.get('limit')) else '-'}"
+                                   f" · suggested stake ${r['stake'] or 0:,.0f} · sharp: "
+                                   f"{('%.0f%% (%s)' % (sp * 100, r.get('sharp_flag'))) if sp else 'no line'}"
+                                   f" · fatigue: {r.get('fatigue') or '-'}")
+                        if r.get("fatigue_note"):
+                            st.caption("Workload: " + r["fatigue_note"])
+                        if r.get("liq"):
+                            st.caption("Liquidity: " + r["liq"])
                     if r["why"]:
                         st.caption(r["why"])
+
+                if do_plimit or do_rlimit:
+                    meta = dict(market_id=r["market_id"], token=tok, match=r["match"], pick=side, surface=r["surface"],
+                                url=r["url"], usd=amt, limit=lim, start=r["start"], model_p=_f(r["model_p"]),
+                                edge=_f(r["edge"]), grade=r.get("grade"), fatigue=r.get("fatigue"), sharp_p=_f(r.get("sharp_p")),
+                                start_ts=r["start"].timestamp() if pd.notna(r["start"]) else None)
+                    if do_plimit:
+                        try:
+                            paper.place_limit(meta["market_id"], tok, meta["match"], side, meta["surface"], meta["url"], amt, lim,
+                                              start=meta["start"], model_p=meta["model_p"], edge=meta["edge"],
+                                              grade=meta["grade"], fatigue=meta["fatigue"], sharp_p=meta["sharp_p"])
+                            st.toast(f"Paper limit order resting: {side} @ {lim:.2f} (${amt:.0f})")
+                        except ValueError as e:
+                            st.error(str(e))
+                    else:
+                        st.session_state["pending_real_limit"] = meta
+                        st.rerun()
 
                 if do_paper:
                     try:
@@ -218,6 +328,68 @@ with tab2:
     h1, h2 = st.columns([1, 5])
     if h1.button("🔄 Settle & refresh"):
         st.toast(f"Settled {paper.settle()} trades")
+    paper.process_orders()
+    cmp = paper.strategy_report()
+    acc = paper.account_summary()
+    st.subheader("Strategy accounts — each strategy trades its own paper money")
+    shown = acc[acc.strategy.isin(paper.STRATEGIES) | (acc.strategy.isin(cmp.strategy) if not cmp.empty else False)]
+    cards = st.columns(max(1, len(shown)))
+    for col, r in zip(cards, shown.itertuples()):
+        cr = cmp[cmp.strategy == r.strategy].iloc[0] if not cmp.empty and (cmp.strategy == r.strategy).any() else None
+        col.metric(r.strategy.title(), f"${r.balance:,.2f}", f"{r.realised_net_pnl:+,.2f} net P&L (start ${r.start:,.0f})")
+        if cr is not None:
+            col.caption(f"{int(cr.bets)} bets · {int(cr.settled)} settled · {int(cr.open)} open"
+                        + (f" · ROI {cr.roi:+.1%}" if cr.roi is not None and pd.notna(cr.roi) else "")
+                        + f" · free cash ${r.free_cash:,.0f}")
+    xmode = st.radio("Profit chart x-axis", ["By date", "By bet number"], horizontal=True, key="curve_x",
+                     help="'By bet number' compares strategies after the same number of bets, which is fairer when one bets less often.")
+    curves = paper.strategy_curves("time" if xmode == "By date" else "bets")
+    if curves.empty:
+        st.info("The profit chart appears after the first settled bet. Click 'Settle & refresh' once matches finish.")
+    else:
+        st.line_chart(curves, y_label="cumulative net profit ($)")
+    if not cmp.empty:
+        v = paper.verdict(cmp)
+        (st.success if v["conclusive"] else st.info)(v["text"])
+    b1, b2, _ = st.columns([2, 1, 3])
+    new_cash = b1.number_input("Starting paper balance per strategy account ($)", 100.0, 1_000_000.0,
+                               float(acc[acc.strategy == "underdog"].start.iloc[0]) if (acc.strategy == "underdog").any() else 1000.0, 100.0)
+    if b2.button("Apply"):
+        paper.set_strategy_cash(new_cash); st.rerun()
+    if not cmp.empty:
+        st.subheader("Strategy comparison (paper trades)")
+        st.dataframe(cmp, hide_index=True, width="stretch", column_config={
+            "hit_rate": st.column_config.NumberColumn("hit rate", format="percent"),
+            "avg_entry": st.column_config.NumberColumn("avg entry", format="%.2f"),
+            "staked": st.column_config.NumberColumn(format="$%.0f"),
+            "pnl_net": st.column_config.NumberColumn("net P&L", format="$%.2f"),
+            "roi": st.column_config.NumberColumn("ROI", format="percent"),
+            "roi_lo": st.column_config.NumberColumn("ROI 95% low", format="percent"),
+            "roi_hi": st.column_config.NumberColumn("ROI 95% high", format="percent"),
+            "clv_cents": st.column_config.NumberColumn("CLV (¢)", format="%.2f")})
+        st.caption("Net P&L deducts the taker fee on market buys (Stack limit fills pay none). Judge a strategy only after ~200 "
+                   "settled bets, and only if the ROI 95% low is above 0. CLV (+ = bought better than the closing price) is the "
+                   "earlier signal. 'manual' = buttons you clicked yourself. Fill rate / expired orders for Stack are in the limit-orders panel.")
+        prog = {r.strategy: r.settled for r in cmp.itertuples()}
+        st.progress(min(1.0, min(prog.get(k, 0) for k in paper.STRATEGIES) / 200), "Progress to 200 settled bets for the slowest strategy")
+    ostat, odf = paper.limit_stats(), paper.orders_df()
+    if ostat["orders"]:
+        with st.expander(f"🎯 Limit orders ({ostat['open']} resting · {ostat['filled']} filled · {ostat['expired']} expired)", expanded=bool(ostat["open"])):
+            fr = ostat["fill_rate"]
+            m = st.columns(4)
+            m[0].metric("Fill rate", "n/a" if fr is None else f"{fr:.0%}")
+            m[1].metric("CLV, filled", "n/a" if ostat["clv_filled"] is None else f"{ostat['clv_filled'] * 100:+.2f}¢", f"n={ostat['n_clv_filled']}", delta_color="off")
+            m[2].metric("CLV, expired (would-have)", "n/a" if ostat["clv_expired"] is None else f"{ostat['clv_expired'] * 100:+.2f}¢", f"n={ostat['n_clv_expired']}", delta_color="off")
+            m[3].caption("CLV = last pre-start mid minus our price (+ = beat the close). Mids are sampled only when this page "
+                         "refreshes, so refresh often before matches. If filled CLV is much lower than expired CLV you are being adversely selected.")
+            st.dataframe(odf[["id", "created_at", "mode", "match", "pick", "limit_price", "usd", "grade", "fatigue", "status", "last_mid", "start"]],
+                         hide_index=True, width="stretch")
+            open_o = odf[(odf.status == "open") & (odf["mode"] == "paper")].id.tolist()
+            if open_o:
+                o1, o2 = st.columns([1, 4])
+                oid = o1.selectbox("Cancel paper order #", open_o)
+                if o2.button("Cancel order"):
+                    paper.cancel_order(oid); st.rerun()
     tdf = paper.trades_df()
     if tdf.empty:
         st.info("No trades yet. Use 📄 Paper buy (fake money) or 💵 Buy (real) on the Markets tab.")
@@ -253,8 +425,8 @@ with tab2:
         st.subheader("All trades")
         mode_f = st.radio("Mode", ["all", "paper", "real"], horizontal=True)
         t = tdf if mode_f == "all" else tdf[tdf["mode"] == mode_f]
-        st.dataframe(t[["id", "day", "mode", "match", "pick", "surface", "status", "entry_price", "shares", "cost", "mtm",
-                        "exit_price", "pnl", "model_p", "edge", "url"]], hide_index=True, width="stretch",
+        st.dataframe(t[["id", "day", "mode", "strategy", "match", "pick", "surface", "status", "entry_price", "shares", "cost", "mtm",
+                        "exit_price", "pnl", "model_p", "edge", "grade", "fatigue", "close_mid", "url"]], hide_index=True, width="stretch",
                      column_config={"url": st.column_config.LinkColumn("Open", display_text="↗")})
         open_paper = tdf[(tdf.status == "open") & (tdf["mode"] == "paper")].id.tolist()
         if open_paper:
@@ -283,17 +455,23 @@ with tab2:
                 st.rerun()
         if cl3.button("⚠️ Reset entire paper account"):
             paper.reset(5000); st.rerun()
+        r1, r2, _ = st.columns([2, 2, 2])
+        one = r1.selectbox("Reset ONE strategy's account", list(paper.STRATEGIES) + ["manual"])
+        if r2.button(f"🗑️ Wipe {one} trades & orders"):
+            paper.reset_strategy(one); st.rerun()
 
 # ------------------------------------------------------------------ tab 3: backtest
 with tab3:
     st.caption("Replays your rules on finished Polymarket tennis matches using the price ~30 min before the start "
                "and ratings that only saw results ≥ 14 days older (pre-match model only; no look-ahead).")
-    f1, f2, _ = st.columns(3)
+    f1, f2, f3 = st.columns(3)
     n_ev = f1.number_input("Closed events to fetch", 200, 10000, 1500, 100)
     if f2.button("⬇️ Fetch / extend backtest data"):
         bar = st.progress(0.0, "Downloading…")
         added = bt.fetch_dataset(int(n_ev), progress=lambda i, t: bar.progress(i / t, f"{i}/{t}"))
         st.success(f"Added {added} matches"); st.rerun()
+    if os.path.exists(bt.DS) and f3.button("🧮 Add fatigue flags to backtest data"):
+        st.success(f"Fatigue flags added for {bt.enrich_dataset()} matches"); st.rerun()
     if not os.path.exists(bt.DS):
         st.info("No backtest data yet. Click fetch (can take several minutes; it is resumable).")
     else:
@@ -304,12 +482,23 @@ with tab3:
         stake = s2.number_input("Flat stake ($)", 1.0, 1000.0, 20.0)
         slip = s3.slider("Slippage (¢ paid above price)", 0.0, 0.05, 0.01, 0.005)
         fee = s4.slider("Fee on profit", 0.0, 0.10, 0.0, 0.01)
-        bt_strat = st.radio("Backtest strategy", ["Underdog", "Favourite", "Every model favourite (no filter)"], horizontal=True)
+        bt_strat = st.radio("Backtest strategy", ["Underdog", "Favourite", "Stack (maker entry)", "Stack (taker entry)",
+                                                  "Every model favourite (no filter)"], horizontal=True)
+        use_fat = st.checkbox("Stack: use the fatigue layer", True)
+        if bt_strat.startswith("Stack"):
+            n_fat = int(pd.concat([ds.fat1, ds.fat2]).isin(["heavy", "rest_edge", "neutral"]).sum())
+            st.caption(f"Stack backtest has no historical sharp-line data (layer 3 off, so grades stay low) and only {n_fat} side-flags "
+                       "with known fatigue (exact dates exist only after the match-history mirror ends). Maker entry assumes every "
+                       "limit order fills: it is the optimistic bound, taker entry the conservative one.")
         base_kw = dict(slip=slip, fee=fee, mode=mode, stake=stake, bankroll=1000.0)
         if bt_strat == "Underdog":
             kw = {**bt.PRESETS["underdog"], **base_kw}
         elif bt_strat == "Favourite":
             kw = {**bt.PRESETS["favourite"], **base_kw}
+        elif bt_strat == "Stack (maker entry)":
+            kw = {**bt.PRESETS["stack"], **base_kw, "use_fatigue": use_fat}
+        elif bt_strat == "Stack (taker entry)":
+            kw = {**bt.PRESETS["stack_taker"], **base_kw, "use_fatigue": use_fat}
         else:
             kw = dict(min_edge=-1.0, min_ev=-1.0, min_prob=0.50, min_price=0.01, max_price=0.99, shrink=1.0, **base_kw)
         bets = bt.run_backtest(ds, **kw); S = bt.summarize(bets)
