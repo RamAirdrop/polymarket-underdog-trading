@@ -12,6 +12,35 @@ import paper
 import tennis_core as tc
 
 st.set_page_config(page_title="Polymarket Tennis", layout="wide", initial_sidebar_state="collapsed")
+
+# ---- stale-module guard -------------------------------------------------------------------------------------------
+# After a deploy/git pull Streamlit re-runs this NEW app.py but can keep OLD copies of the imported modules in memory
+# (symptom: AttributeError: module 'paper' has no attribute 'process_orders'). Detect that, reload, and if the files on
+# disk really are old, say so plainly instead of crashing.
+import importlib
+import sys
+
+_REQUIRED = [(es, ("SharpFeed", "Workload", "decide")), (tc, ("build_workload", "analyse")),
+             (bt, ("enrich_dataset", "run_backtest")), (live_trade, ("real_limit_buy", "order_status")),
+             (paper, ("process_orders", "auto_all", "strategy_curves", "account_summary", "verdict", "reset_strategy"))]
+
+
+def _missing():
+    return [f"{m.__name__}.{n}" for m, names in _REQUIRED for n in names if not hasattr(m, n)]
+
+
+if _missing():
+    for _m in (es, tc, bt, live_trade, paper):          # dependency order: edge_stack -> tennis_core -> backtest ...
+        importlib.reload(_m)
+    st.cache_resource.clear()                           # cached ratings/workload were built by the old code
+if _missing():
+    st.error("The app files on this server are older than app.py, so it cannot start. Missing: "
+             + ", ".join(_missing()))
+    st.code("\n".join(f"{m.__name__}: {m.__file__} ({os.path.getsize(m.__file__):,} bytes, python {sys.version.split()[0]})"
+                      for m, _ in _REQUIRED))
+    st.info("Fix: make sure ALL files from the latest commit are deployed (paper.py, tennis_core.py, edge_stack.py, "
+            "backtest.py, live_trade.py, app.py), then Manage app > Reboot app.")
+    st.stop()
 st.markdown(
     """
     <style>
